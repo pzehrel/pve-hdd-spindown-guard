@@ -12,7 +12,7 @@
 # Usage:
 #   spindown-guard                         # run with saved config
 #   spindown-guard -i ata-DISK1 -i ata-DISK2   # overwrite config & run
-#   spindown-guard --select -t 20          # interactive disk picker
+#   spindown-guard -i sdb -i sdd -t 20     # specify disks
 #   spindown-guard --status                # show per-disk state
 #   spindown-guard --once -s sdb           # one-shot spindown (no config)
 #   spindown-guard --install               # systemd service
@@ -20,7 +20,7 @@
 
 set -euo pipefail
 
-readonly SCRIPT_VERSION="1.0.0"
+readonly SCRIPT_VERSION="1.2.0"
 readonly CONFIG_FILE="/etc/spindown-guard.conf"
 readonly STATE_DIR="/var/lib/spindown-guard"
 readonly AT_JOB_TAG="spindown-guard"
@@ -28,10 +28,9 @@ readonly LOCK_FILE="/var/run/spindown-guard.lock"
 
 # ── CLI defaults ──────────────────────────────────────────────────
 IDLE_MIN=20
-IDLE_EXPLICIT=false
 DRY_RUN=false
 QUIET=false
-COMMAND=""                     # ""=run, select, status, install, uninstall, ls, once
+COMMAND=""                     # ""=run, ls, status, install, uninstall, once
 DISK_IDS=()                    # by-id strings
 SPIN_DEV=""                    # for --once -s
 IS_TTY=false
@@ -86,6 +85,24 @@ is_rotational() {
 smart_passed() {
     local out; out=$(smartctl -H "/dev/${1}" 2>&1) || true
     echo "${out}" | grep -qi "PASSED"
+}
+# Check if a disk is held by a QEMU/KVM process
+disk_holders() {
+    local dev="${1}"
+    local pids; pids=$(fuser "/dev/${dev}" 2>/dev/null | tr -d ' ') || true
+    if [ -n "${pids}" ]; then
+        for pid in ${pids}; do
+            local comm; comm=$(ps -o comm= -p "${pid}" 2>/dev/null || true)
+            if echo "${comm}" | grep -qi "qemu\|kvm"; then
+                echo "qemu"
+                return 0
+            fi
+        done
+        echo "other"
+        return 0
+    fi
+    echo "none"
+    return 0
 }
 
 # ── Locking ───────────────────────────────────────────────────────
@@ -210,13 +227,13 @@ process_disk() {
 # ── Status display ────────────────────────────────────────────────
 
 cmd_status() {
-    load_config || { echo "无配置文件 (${CONFIG_FILE})。请先运行 --select 或 -i。"; exit 1; }
+    load_config || { echo "无配置文件 (${CONFIG_FILE})。请先用 -i 指定磁盘。"; exit 1; }
 
-    printf "%-6s %-55s %-12s %s\n" "DEV" "BY-ID" "STATE" "IDLE"
-    printf "%-6s %-55s %-12s %s\n" "---" "-----" "-----" "----"
+    printf "%-6s %-55s %-10s %-7s %s\n" "DEV" "BY-ID" "STATE" "HELD" "IDLE"
+    printf "%-6s %-55s %-10s %-7s %s\n" "---" "-----" "-----" "-----" "----"
 
     for disk_id in "${DISK_IDS[@]}"; do
-        local dev; dev=$(resolve_dev "${disk_id}" 2>/dev/null) || { printf "%-6s %-55s %-12s %s\n" "?" "${disk_id:0:54}" "RESOLVE_ERR" "-"; continue; }
+        local dev; dev=$(resolve_dev "${disk_id}" 2>/dev/null) || { printf "%-6s %-55s %-10s %-7s %s\n" "?" "${disk_id:0:54}" "ERR" "-" "-"; continue; }
         local pwr; pwr=$(get_power_state "${dev}" 2>/dev/null || echo "unknown")
         local cur; cur=$(get_sectors "${dev}" 2>/dev/null || echo "?")
 
@@ -237,109 +254,16 @@ cmd_status() {
             fi
         fi
 
-        printf "%-6s %-55s %-12s %s\n" "${dev}" "${disk_id:0:54}" "${state_str}" "${idle_str}"
+        local holder; holder=$(disk_holders "${dev}")
+        printf "%-6s %-55s %-10s %-7s %s\n" "${dev}" "${disk_id:0:54}" "${state_str}" "${holder}" "${idle_str}"
     done
-}
-
-# ── Interactive selector ──────────────────────────────────────────
-
-cmd_select() {
-    # Gather all rotational ATA disks
-    local all_ids=() all_devs=() all_sizes=()
-    for link in /dev/disk/by-id/ata-*; do
-        [ -e "${link}" ] || continue
-        [[ "$(basename "${link}")" =~ -part ]] && continue
-        local dev; dev=$(basename "$(readlink -f "${link}")")
-        is_rotational "${dev}" || continue
-        all_ids+=("$(basename "${link}")")
-        all_devs+=("${dev}")
-        all_sizes+=("$(lsblk -dno SIZE "/dev/${dev}" 2>/dev/null || echo "?")")
-    done
-
-    [ "${#all_ids[@]}" -gt 0 ] || die "未找到任何 SATA HDD"
-
-    # Determine which ones are currently monitored
-    local -A current_selected
-    for id in "${DISK_IDS[@]}"; do current_selected["${id}"]=1; done
-
-    if ! $IS_TTY; then
-        echo "非 TTY 环境，无法交互选择。请用 -i 指定："
-        echo ""
-        printf "  %-5s %-55s %8s %s\n" "DEV" "BY-ID" "SIZE" "SMART"
-        for i in "${!all_ids[@]}"; do
-            local mark=" "
-            [ -n "${current_selected[${all_ids[$i]}]:-}" ] && mark="*"
-            local dev="${all_devs[$i]}"
-            local sm="?"
-            smart_passed "${dev}" && sm="✓" || sm="✗"
-            printf "  %s %-5s %-55s %8s %s\n" "${mark}" "${dev}" "${all_ids[$i]:0:54}" "${all_sizes[$i]}" "${sm}"
-        done
-        echo ""
-        echo "  示例: $(basename "${0}") -i ${all_ids[0]} -t ${IDLE_MIN}"
-        exit 1
-    fi
-
-    # Build selection list
-    echo ""
-    echo "选择要监控的硬盘（空格分隔编号，或 'all' / 'none'）"
-    echo "已选 = 当前配置中的盘"
-    echo ""
-
-    for i in "${!all_ids[@]}"; do
-        local mark="[ ]"
-        local cursor=""
-        [ -n "${current_selected[${all_ids[$i]}]:-}" ] && mark="[✓]"
-        local dev="${all_devs[$i]}"
-        local extra=""
-        smart_passed "${dev}" || extra=" ⚠️"
-        is_rotational "${dev}" || extra="${extra} SSD"
-        printf "  %s %2d. %-5s %-52s %6s%s\n" "${mark}" "$((i+1))" "${dev}" "${all_ids[$i]}" "${all_sizes[$i]}" "${extra}"
-    done
-
-    echo ""
-    echo -n "输入编号 (默认 = 不变): "
-    read -r input
-
-    # Parse input
-    local new_ids=()
-    if [ -z "${input}" ]; then
-        # Keep current
-        new_ids=("${DISK_IDS[@]}")
-        echo "→ 保持当前选择"
-    elif [ "${input}" = "all" ]; then
-        new_ids=("${all_ids[@]}")
-        echo "→ 全选（${#new_ids[@]} 块盘）"
-    elif [ "${input}" = "none" ]; then
-        new_ids=()
-        echo "→ 清空选择"
-    else
-        # shellcheck disable=SC2086
-        for num in ${input}; do
-            if [[ "${num}" =~ ^[0-9]+$ ]] && [ "${num}" -ge 1 ] && [ "${num}" -le "${#all_ids[@]}" ]; then
-                new_ids+=("${all_ids[$((num-1))]}")
-            fi
-        done
-        echo "→ 选择了 ${#new_ids[@]} 块盘"
-    fi
-
-    DISK_IDS=("${new_ids[@]}")
-
-    # Ask for idle threshold if not already specified explicitly
-    if [ "${IDLE_EXPLICIT}" = false ]; then
-        echo ""
-        echo -n "空闲阈值（分钟，默认 ${IDLE_MIN}）: "
-        read -r idle_input
-        if [ -n "${idle_input}" ] && [[ "${idle_input}" =~ ^[0-9]+$ ]] && [ "${idle_input}" -gt 0 ]; then
-            IDLE_MIN="${idle_input}"
-        fi
-    fi
 }
 
 # ── List disks ────────────────────────────────────────────────────
 
 cmd_ls() {
-    printf "%-5s %-55s %8s %s\n" "DEV" "BY-ID" "SIZE" "SMART"
-    printf "%-5s %-55s %8s %s\n" "---" "-----" "----" "-----"
+    printf "%-5s %-55s %8s %-7s %s\n" "DEV" "BY-ID" "SIZE" "HELD" "SMART"
+    printf "%-5s %-55s %8s %-7s %s\n" "---" "-----" "----" "-----" "-----"
     for link in /dev/disk/by-id/ata-*; do
         [ -e "${link}" ] || continue
         [[ "$(basename "${link}")" =~ -part ]] && continue
@@ -348,9 +272,10 @@ cmd_ls() {
         local sz; sz=$(lsblk -dno SIZE "/dev/${dev}" 2>/dev/null || echo "?")
         local hdd; hdd=""
         is_rotational "${dev}" && hdd="HDD" || hdd="SSD"
+        local holder; holder=$(disk_holders "${dev}")
         local sm; sm="?"
         smart_passed "${dev}" && sm="✓" || sm="✗"
-        printf "%-5s %-55s %8s %s %s\n" "${dev}" "${id:0:54}" "${sz}" "${hdd}" "${sm}"
+        printf "%-5s %-55s %8s %-7s %s\n" "${dev}" "${id:0:54}" "${sz}" "${holder}" "${sm}"
     done
 }
 
@@ -359,22 +284,23 @@ cmd_ls() {
 cmd_once() {
     if [ -n "${SPIN_DEV}" ]; then
         # Immediate spindown of a specific disk
-        local disk_path="/dev/${SPIN_DEV}"
+        local _dev; _dev="${SPIN_DEV#/dev/}"   # sdb, /dev/sdb → sdb
+        local disk_path="/dev/${_dev}"
         [ -b "${disk_path}" ] || die "${disk_path} 不是有效的块设备"
-        local pwr; pwr=$(get_power_state "${SPIN_DEV}")
+        local pwr; pwr=$(get_power_state "${_dev}")
         case "${pwr}" in
             standby|sleep)
-                echo "${SPIN_DEV}: 已是 ${pwr}，无需操作"
+                echo "${_dev}: 已是 ${pwr}，无需操作"
                 exit 0 ;;
         esac
-        log "立即停转 ${SPIN_DEV}..."
+        log "立即停转 ${_dev}..."
         if [ "${DRY_RUN}" = true ]; then
             log "[dry-run] hdparm -y ${disk_path}"
         else
             sync
             hdparm -y "${disk_path}" >/dev/null 2>&1 \
-                && log "${SPIN_DEV}: → standby" \
-                || die "${SPIN_DEV}: hdparm -y 失败"
+                && log "${_dev}: → standby" \
+                || die "${_dev}: hdparm -y 失败"
         fi
         exit 0
     fi
@@ -499,7 +425,6 @@ spindown-guard v${SCRIPT_VERSION} — SATA HDD 空闲停转守护
 用法:
   $(basename "${0}")                        从配置文件读取并运行（用于 systemd / at）
   $(basename "${0}") -i <by-id> [-i ...]    指定磁盘，写入配置并运行
-  $(basename "${0}") --select [-t <分钟>]    交互式勾选磁盘
   $(basename "${0}") --status               查看监控状态
   $(basename "${0}") --ls                   列出所有 ATA 磁盘
   $(basename "${0}") --once -s <dev>        立即停转一块盘
@@ -508,7 +433,6 @@ spindown-guard v${SCRIPT_VERSION} — SATA HDD 空闲停转守护
 
 参数:
   -i, --disk <id>    磁盘 by-id 或设备名 sdb（可重复，每次覆盖完整列表）
-  --select           交互式选择（优先 fzf，降级为编号输入）
   --all              自动选择所有 SATA HDD
   --once             单次运行，不保存配置、不调度后续
   -s, --spin <dev>   配合 --once，立即停转指定盘（如 sdb）
@@ -526,7 +450,6 @@ spindown-guard v${SCRIPT_VERSION} — SATA HDD 空闲停转守护
   通过 at(1) 自调度，间隔 = 最短剩余空闲时间。所有盘 standby 后暂停。
 
 示例:
-  $(basename "${0}") --select -t 20          # 交互式选择，20 分钟空闲后停转
   $(basename "${0}") -i ata-DISK1 -i ata-DISK2          # 监控两块盘
   $(basename "${0}") --once -s sdb           # 立即停转 sdb
   $(basename "${0}") --status               # 查看所有盘状态
@@ -547,7 +470,6 @@ while [ $# -gt 0 ]; do
                 DISK_IDS+=("${_arg}")
             fi
             shift 2 ;;
-        --select) COMMAND="select"; shift ;;
         --ls)     COMMAND="ls"; shift ;;
         --status) COMMAND="status"; shift ;;
         --once)   COMMAND="once"; shift ;;
@@ -561,7 +483,7 @@ while [ $# -gt 0 ]; do
             done
             shift ;;
         -t|--idle)
-            [ -n "${2:-}" ] || die "-t 需要分钟数"; IDLE_MIN="${2}"; IDLE_EXPLICIT=true; shift 2 ;;
+            [ -n "${2:-}" ] || die "-t 需要分钟数"; IDLE_MIN="${2}"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         -q|--quiet) QUIET=true; shift ;;
         --install) COMMAND="install"; shift ;;
@@ -585,11 +507,11 @@ case "${COMMAND}" in
     "")
         if [ "${#DISK_IDS[@]}" -gt 0 ]; then
             cmd_run
-        elif $IS_TTY; then
-            cmd_select
-            [ "${#DISK_IDS[@]}" -gt 0 ] && { save_config; cmd_run; } || echo "未选择磁盘，退出。"
+        elif load_config 2>/dev/null; then
+            # at-scheduled / systemd run — ok, config loaded
+            cmd_run
         else
-            die "非 TTY 环境，请使用参数:\n  $(basename "${0}") -i sdb [sdc ...] [-t 分钟]\n  $(basename "${0}") --all\n  $(basename "${0}") -h"
+            die "未指定磁盘。\n\n  用法: $(basename "${0}") -i sdb [-i sdc ...] [-t 分钟]\n        $(basename "${0}") --all\n\n  查看可用磁盘: $(basename "${0}") --ls"
         fi
         ;;
     *)        die "未知命令: ${COMMAND}" ;;

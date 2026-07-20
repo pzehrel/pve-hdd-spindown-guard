@@ -23,12 +23,6 @@ make install
 ## Usage
 
 ```bash
-# No args — interactive disk picker (TTY required)
-spindown-guard
-
-# Pick disks interactively
-spindown-guard --select -t 20
-
 # Specify disks by name (resolves to by-id automatically)
 spindown-guard -i sdb -i sdd -t 20
 
@@ -38,10 +32,10 @@ spindown-guard -i ata-WDC_WD10PURX-...WD-WCAW3FTHF6L5 -t 20
 # All rotational ATA disks
 spindown-guard --all -t 20
 
-# Show monitored disk states
+# Show monitored disk states (includes QEMU holder info)
 spindown-guard --status
 
-# List all ATA disks
+# List all ATA disks (includes SMART and QEMU holder info)
 spindown-guard --ls
 
 # One-shot spindown (call from backup scripts)

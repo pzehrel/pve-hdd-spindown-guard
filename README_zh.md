@@ -21,14 +21,11 @@ make install
 ## 用法
 
 ```bash
-spindown-guard                      # 直接运行 → 交互式选择
-spindown-guard -h                   # 帮助
+spindown-guard --ls                    # 列出所有 ATA 磁盘
+spindown-guard -h                      # 帮助
 ```
 
 ```bash
-# 交互式选择
-spindown-guard --select -t 20
-
 # CLI 指定（支持简写 sdb，自动解析为 by-id）
 spindown-guard -i sdb -i sdd -t 20
 
@@ -38,10 +35,10 @@ spindown-guard -i ata-WDC_WD10PURX-...WD-WCAW3FTHF6L5 -t 20
 # 监控所有 HDD
 spindown-guard --all -t 20
 
-# 查看状态
+# 查看状态（含 QEMU 持有信息）
 spindown-guard --status
 
-# 列出所有 ATA 磁盘
+# 列出所有磁盘（含 SMART 和 QEMU 持有信息）
 spindown-guard --ls
 
 # 立即停转（备份脚本末尾调用）
