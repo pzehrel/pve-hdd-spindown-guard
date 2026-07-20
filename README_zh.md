@@ -13,6 +13,9 @@ QEMU 持有直通块设备时会周期性发 flush/MODE_SENSE 等命令重置硬
 ## 安装
 
 ```bash
+# 依赖
+apt install hdparm at
+
 git clone https://github.com/pzehrel/pve-hdd-spindown-guard.git
 cd pve-hdd-spindown-guard
 make install
@@ -68,10 +71,6 @@ spindown-guard --uninstall
 ```
 
 通过 `at(1)` 自调度，下次检测时间 = 最短剩余空闲时间。所有盘 standby 后自动暂停。
-
-## 依赖
-
-`bash`、`hdparm`、`at`
 
 ## License
 

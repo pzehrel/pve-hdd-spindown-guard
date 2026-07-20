@@ -15,6 +15,9 @@ This script replaces firmware idle timers with **`/proc/diskstats` sector-count 
 ## Install
 
 ```bash
+# Prerequisites
+apt install hdparm at
+
 git clone https://github.com/pzehrel/pve-hdd-spindown-guard.git
 cd pve-hdd-spindown-guard
 make install
@@ -65,10 +68,6 @@ read /proc/diskstats sector counters → compare to snapshot
 ```
 
 Self-schedules via `at(1)` at the optimal interval (shortest remaining idle time). Pauses when all disks are standby.
-
-## Dependencies
-
-`bash`, `hdparm`, `at`
 
 ## License
 
