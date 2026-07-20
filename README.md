@@ -1,14 +1,18 @@
 # pve-hdd-spindown-guard
 
-SATA HDD 空闲停转守护 — 跑在 PVE Host 上，监控直通给 VM 的机械硬盘，空闲后自动 `hdparm -y`。
+SATA HDD idle-spindown daemon for Proxmox VE. Runs on the PVE host, monitors pass-through HDDs via `/proc/diskstats`, and issues `hdparm -y` when disks are idle.
 
-## 解决的问题
+> [中文](README_zh.md)
 
-QEMU 持有直通块设备时会周期性发 flush/MODE_SENSE 等命令重置硬盘 idle timer，导致 `hdparm -S` 无论怎么设都无法触发自动停转。
+## The Problem
 
-本脚本通过 **`/proc/diskstats` 扇区计数监控** 替代 idle timer：QEMU 控制命令不产生数据扇区读写，不计入计数 → 真正空闲时计数不变 → 达到阈值后 `hdparm -y`。
+QEMU holding a pass-through block device periodically issues flush / MODE_SENSE commands that reset the drive's firmware idle timer. This makes `hdparm -S` unusable — the drive never enters standby automatically.
 
-## 安装
+## The Solution
+
+This script replaces firmware idle timers with **`/proc/diskstats` sector-count monitoring**. QEMU control commands don't read or write data sectors, so they never increment the counters. When the counter stays flat long enough, the disk is truly idle and `hdparm -y` is safe to call.
+
+## Install
 
 ```bash
 git clone https://github.com/pzehrel/pve-hdd-spindown-guard.git
@@ -16,42 +20,45 @@ cd pve-hdd-spindown-guard
 make install
 ```
 
-## 用法
+## Usage
 
 ```bash
-# 交互式选择
+# No args — interactive disk picker (TTY required)
+spindown-guard
+
+# Pick disks interactively
 spindown-guard --select -t 20
 
-# CLI 指定
+# Specify disks explicitly
 spindown-guard -i ata-WDC_WD10PURX-...WD-WCAW3FTHF6L5 -t 20
 
-# 监控所有 HDD
+# All rotational ATA disks
 spindown-guard --all -t 20
 
-# 查看状态
+# Show monitored disk states
 spindown-guard --status
 
-# 立即停转（备份脚本末尾调用）
+# One-shot spindown (call from backup scripts)
 spindown-guard --once -s sdb
 
-# 开机启动
+# Install systemd service (auto-start on boot)
 spindown-guard --install
 ```
 
-## 原理
+## How It Works
 
 ```
-/proc/diskstats 扇区计数 → 状态文件快照对比
-  → 计数变化 → 盘在使用 → 重置空闲计时
-  → 计数不变 → 累计空闲时间 → 达阈值 → hdparm -y
-  → 已 standby → 跳过
+read /proc/diskstats sector counters → compare to snapshot
+  → changed → disk is busy → reset idle timer
+  → unchanged → accumulating idle time → threshold reached → hdparm -y
+  → already standby → skip
 ```
 
-通过 `at(1)` 自调度，下次检测时间 = 最短剩余空闲时间。所有盘 standby 后自动暂停。
+Self-schedules via `at(1)` at the optimal interval (shortest remaining idle time). Pauses when all disks are standby.
 
-## 依赖
+## Dependencies
 
-- `bash`、`hdparm`、`at`、`smartctl`（选项）
+`bash`, `hdparm`, `at`, `smartmontools` (optional, for SMART status in `--ls`)
 
 ## License
 

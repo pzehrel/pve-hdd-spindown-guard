@@ -41,9 +41,27 @@ IS_TTY=false
 log()    { [ "${QUIET}" = false ] && echo "[$(date '+%H:%M:%S')] ${*}" >&2; }
 warn()   { echo "[$(date '+%H:%M:%S')] WARN: ${*}" >&2; }
 err()    { echo "[$(date '+%H:%M:%S')] ERROR: ${*}" >&2; }
-die()    { err "${*}"; exit 1; }
+die()    { printf "%b\n" "$*" >&2; exit 1; }
 
 resolve_dev() { basename "$(readlink -f "/dev/disk/by-id/${1}" 2>/dev/null)" 2>/dev/null; }
+
+# Resolve a short name (sdb, /dev/sdb) → full by-id
+# Returns the by-id string, or empty if not found.
+resolve_to_id() {
+    local input="${1#/dev/}"          # strip /dev/ prefix if present
+    local dev; dev=$(basename "${input}")  # pure kernel name: sdb
+
+    for link in /dev/disk/by-id/ata-*; do
+        [ -e "${link}" ] || continue
+        [[ "$(basename "${link}")" =~ -part ]] && continue
+        local target; target=$(basename "$(readlink -f "${link}")")
+        if [ "${target}" = "${dev}" ]; then
+            basename "${link}"
+            return 0
+        fi
+    done
+    return 1
+}
 
 get_sectors() {
     local dev="${1}"
@@ -478,7 +496,7 @@ spindown-guard v${SCRIPT_VERSION} — SATA HDD 空闲停转守护
   $(basename "${0}") --uninstall            卸载
 
 参数:
-  -i, --disk <id>    磁盘 by-id（可重复，每次覆盖完整列表）
+  -i, --disk <id>    磁盘 by-id 或设备名 sdb（可重复，每次覆盖完整列表）
   --select           交互式选择（优先 fzf，降级为编号输入）
   --all              自动选择所有 SATA HDD
   --once             单次运行，不保存配置、不调度后续
@@ -509,7 +527,15 @@ HELP
 while [ $# -gt 0 ]; do
     case "${1}" in
         -i|--disk)
-            [ -n "${2:-}" ] || die "-i 需要 by-id"; DISK_IDS+=("${2}"); shift 2 ;;
+            [ -n "${2:-}" ] || die "-i 需要 by-id 或设备名（如 sdb）"
+            _arg="${2}"
+            if [[ "${_arg}" =~ ^/dev/ ]] || [[ ! "${_arg}" =~ ^ata- ]]; then
+                _resolved=$(resolve_to_id "${_arg}") || die "无法解析: ${_arg}"
+                DISK_IDS+=("${_resolved}")
+            else
+                DISK_IDS+=("${_arg}")
+            fi
+            shift 2 ;;
         --select) COMMAND="select"; shift ;;
         --ls)     COMMAND="ls"; shift ;;
         --status) COMMAND="status"; shift ;;
@@ -519,8 +545,8 @@ while [ $# -gt 0 ]; do
         --all)
             for l in /dev/disk/by-id/ata-*; do
                 [ -e "${l}" ] || continue; [[ "$(basename "${l}")" =~ -part ]] && continue
-                local d; d=$(basename "$(readlink -f "${l}")")
-                is_rotational "${d}" && DISK_IDS+=("$(basename "${l}")")
+                _d=$(basename "$(readlink -f "${l}")")
+                is_rotational "${_d}" && DISK_IDS+=("$(basename "${l}")")
             done
             shift ;;
         -t|--idle)
@@ -545,6 +571,15 @@ case "${COMMAND}" in
     install)  cmd_install ;;
     uninstall) cmd_uninstall ;;
     once)     cmd_once ;;
-    "")       cmd_run ;;
+    "")
+        if [ "${#DISK_IDS[@]}" -gt 0 ]; then
+            cmd_run
+        elif $IS_TTY; then
+            cmd_select
+            [ "${#DISK_IDS[@]}" -gt 0 ] && { save_config; cmd_run; } || echo "未选择磁盘，退出。"
+        else
+            die "非 TTY 环境，请使用参数:\n  $(basename "${0}") -i sdb [sdc ...] [-t 分钟]\n  $(basename "${0}") --all\n  $(basename "${0}") -h"
+        fi
+        ;;
     *)        die "未知命令: ${COMMAND}" ;;
 esac
