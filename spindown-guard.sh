@@ -28,6 +28,7 @@ readonly LOCK_FILE="/var/run/spindown-guard.lock"
 
 # ── CLI defaults ──────────────────────────────────────────────────
 IDLE_MIN=20
+IDLE_EXPLICIT=false
 DRY_RUN=false
 QUIET=false
 COMMAND=""                     # ""=run, select, status, install, uninstall, ls, once
@@ -322,6 +323,16 @@ cmd_select() {
     fi
 
     DISK_IDS=("${new_ids[@]}")
+
+    # Ask for idle threshold if not already specified explicitly
+    if [ "${IDLE_EXPLICIT}" = false ]; then
+        echo ""
+        echo -n "空闲阈值（分钟，默认 ${IDLE_MIN}）: "
+        read -r idle_input
+        if [ -n "${idle_input}" ] && [[ "${idle_input}" =~ ^[0-9]+$ ]] && [ "${idle_input}" -gt 0 ]; then
+            IDLE_MIN="${idle_input}"
+        fi
+    fi
 }
 
 # ── List disks ────────────────────────────────────────────────────
@@ -550,7 +561,7 @@ while [ $# -gt 0 ]; do
             done
             shift ;;
         -t|--idle)
-            [ -n "${2:-}" ] || die "-t 需要分钟数"; IDLE_MIN="${2}"; shift 2 ;;
+            [ -n "${2:-}" ] || die "-t 需要分钟数"; IDLE_MIN="${2}"; IDLE_EXPLICIT=true; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         -q|--quiet) QUIET=true; shift ;;
         --install) COMMAND="install"; shift ;;
