@@ -83,8 +83,9 @@ is_rotational() {
 }
 
 smart_passed() {
+    command -v smartctl >/dev/null 2>&1 || { echo "-"; return 0; }
     local out; out=$(smartctl -H "/dev/${1}" 2>&1) || true
-    echo "${out}" | grep -qi "PASSED"
+    echo "${out}" | grep -qi "PASSED" && { echo "✓"; return 0; } || { echo "✗"; return 0; }
 }
 # Check if a disk is held by a QEMU/KVM process
 disk_holders() {
@@ -273,8 +274,7 @@ cmd_ls() {
         local hdd; hdd=""
         is_rotational "${dev}" && hdd="HDD" || hdd="SSD"
         local holder; holder=$(disk_holders "${dev}")
-        local sm; sm="?"
-        smart_passed "${dev}" && sm="✓" || sm="✗"
+        local sm; sm=$(smart_passed "${dev}")
         printf "%-5s %-55s %8s %-7s %s\n" "${dev}" "${id:0:54}" "${sz}" "${holder}" "${sm}"
     done
 }

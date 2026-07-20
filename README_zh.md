@@ -71,7 +71,7 @@ spindown-guard --uninstall
 
 ## 依赖
 
-- `bash`、`hdparm`、`at`、`smartmontools`（可选）
+`bash`、`hdparm`、`at`
 
 ## License
 

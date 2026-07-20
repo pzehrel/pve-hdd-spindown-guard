@@ -68,7 +68,7 @@ Self-schedules via `at(1)` at the optimal interval (shortest remaining idle time
 
 ## Dependencies
 
-`bash`, `hdparm`, `at`, `smartmontools` (optional, for SMART status in `--ls`)
+`bash`, `hdparm`, `at`
 
 ## License
 
