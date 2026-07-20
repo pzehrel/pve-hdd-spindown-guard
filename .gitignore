@@ -1,0 +1,6 @@
+*.state
+*.old
+*.gz
+*.swp
+*~
+.DS_Store
