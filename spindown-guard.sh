@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# spindown-guard — SATA HDD idle-spindown daemon
+# spindown-guard — SATA HDD idle-spindown daemon for Proxmox VE
 #
 # Monitors HDDs via /proc/diskstats sector counters. When a disk has been
 # idle (no data I/O) for a configurable threshold, issues hdparm -y.
@@ -12,7 +12,7 @@
 # Usage:
 #   spindown-guard                         # run with saved config
 #   spindown-guard -i ata-DISK1 -i ata-DISK2   # overwrite config & run
-#   spindown-guard -i sdb -i sdd -t 20     # specify disks
+#   spindown-guard -i sdb -i sdd -t 20     # monitor specific disks
 #   spindown-guard --status                # show per-disk state
 #   spindown-guard --once -s sdb           # one-shot spindown (no config)
 #   spindown-guard --install               # systemd service
@@ -43,8 +43,7 @@ die()    { printf "%b\n" "$*" >&2; exit 1; }
 
 resolve_dev() { basename "$(readlink -f "/dev/disk/by-id/${1}" 2>/dev/null)" 2>/dev/null; }
 
-# Resolve a short name (sdb, /dev/sdb) → full by-id
-# Returns the by-id string, or empty if not found.
+# Resolve a short device name (sdb, /dev/sdb) → full by-id path.
 resolve_to_id() {
     local input="${1#/dev/}"          # strip /dev/ prefix if present
     local dev; dev=$(basename "${input}")  # pure kernel name: sdb
@@ -111,7 +110,7 @@ acquire_lock() {
     mkdir -p "$(dirname "${LOCK_FILE}")"
     exec {LOCK_FD}>"${LOCK_FILE}"
     if ! flock -n "${LOCK_FD}"; then
-        die "另一个 spindown-guard 实例正在运行（lock: ${LOCK_FILE}）"
+        die "Another spindown-guard instance is running (lock: ${LOCK_FILE})"
     fi
 }
 
@@ -153,14 +152,14 @@ schedule_next() {
     local at_when="now + ${min_remain} minutes"
 
     if [ "${DRY_RUN}" = true ]; then
-        log "[dry-run] 将调度: at ${at_when}"
+        log "[dry-run] would schedule: at ${at_when}"
     else
         echo "${at_cmd}  # ${AT_JOB_TAG}" | at "${at_when}" 2>/dev/null || {
-            warn "at 调度失败 — atd 是否在运行？"
-            warn "  手动: ${at_cmd}"
+            warn "at scheduling failed — is atd running?"
+            warn "  Manual: ${at_cmd}"
             return 1
         }
-        log "下次检测: ${at_when}（${min_remain} 分钟后）"
+        log "Next check: ${at_when} (in ${min_remain} min)"
     fi
 }
 
@@ -168,21 +167,21 @@ schedule_next() {
 
 process_disk() {
     local disk_id="${1}"
-    local dev; dev=$(resolve_dev "${disk_id}") || { err "无法解析: ${disk_id}"; return 1; }
+    local dev; dev=$(resolve_dev "${disk_id}") || { err "cannot resolve: ${disk_id}"; return 1; }
 
     local state_file="${STATE_DIR}/${dev}.state"
     local now; now=$(date +%s)
-    local cur; cur=$(get_sectors "${dev}") || { err "读取 ${dev} I/O 失败"; return 1; }
+    local cur; cur=$(get_sectors "${dev}") || { err "failed to read I/O for ${dev}"; return 1; }
     local pwr; pwr=$(get_power_state "${dev}")
 
-    # Already sleeping — done
+    # Already in standby/sleep — nothing to do
     case "${pwr}" in
         standby|sleep) rm -f "${state_file}"; return 0 ;;
         active/idle|active|idle) ;;
-        *) warn "${dev}: 未知电源状态 '${pwr}'"; return 1 ;;
+        *) warn "${dev}: unknown power state '${pwr}'"; return 1 ;;
     esac
 
-    # Compare with snapshot
+    # Compare sector count with previous snapshot
     local prev_sectors=0 idle_since=0
     if [ -f "${state_file}" ]; then
         read -r prev_sectors idle_since < "${state_file}" 2>/dev/null || true
@@ -191,7 +190,7 @@ process_disk() {
     fi
 
     if [ "${cur}" != "${prev_sectors}" ]; then
-        [ "${QUIET}" = false ] && log "${dev}: I/O 活跃 → 重置空闲计时"
+        [ "${QUIET}" = false ] && log "${dev}: I/O active — resetting idle timer"
         echo "${cur} ${now}" > "${state_file}"
         return 1
     fi
@@ -203,21 +202,21 @@ process_disk() {
     local threshold_secs=$(( IDLE_MIN * 60 ))
 
     if [ "${idle_secs}" -ge "${threshold_secs}" ]; then
-        log "${dev}: 空闲 ${idle_mins} 分钟 ≥ ${IDLE_MIN} 分钟 → 停转"
+        log "${dev}: idle ${idle_mins} min ≥ threshold ${IDLE_MIN} min → spinning down"
         if [ "${DRY_RUN}" = true ]; then
             log "[dry-run] hdparm -y /dev/${dev}"
         else
             sync
-            hdparm -y "/dev/${dev}" >/dev/null 2>&1 && log "${dev}: → standby" || { warn "${dev}: hdparm -y 失败"; return 1; }
+            hdparm -y "/dev/${dev}" >/dev/null 2>&1 && log "${dev}: → standby" || { warn "${dev}: hdparm -y failed"; return 1; }
         fi
         rm -f "${state_file}"
         return 0
     fi
 
-    # Not yet — update state, return remaining minutes
+    # Not yet at threshold — persist state, return remaining minutes
     local remain=$(( IDLE_MIN - idle_mins ))
     [ "${remain}" -lt 1 ] && remain=1
-    [ "${QUIET}" = false ] && log "${dev}: 空闲 ${idle_mins}/${IDLE_MIN} min（还需 ${remain} min）"
+    [ "${QUIET}" = false ] && log "${dev}: idle ${idle_mins}/${IDLE_MIN} min (${remain} min remaining)"
     echo "${cur} ${idle_since}" > "${state_file}"
     echo "${remain}"
     return 2
@@ -226,7 +225,7 @@ process_disk() {
 # ── Status display ────────────────────────────────────────────────
 
 cmd_status() {
-    load_config || { echo "无配置文件 (${CONFIG_FILE})。请先用 -i 指定磁盘。"; exit 1; }
+    load_config || { echo "No config file (${CONFIG_FILE}). Run: spindown-guard -i sdb"; exit 1; }
 
     printf "%-6s %-55s %-10s %-7s %s\n" "DEV" "BY-ID" "STATE" "HELD" "IDLE"
     printf "%-6s %-55s %-10s %-7s %s\n" "---" "-----" "-----" "-----" "----"
@@ -281,30 +280,30 @@ cmd_ls() {
 
 cmd_once() {
     if [ -n "${SPIN_DEV}" ]; then
-        # Immediate spindown of a specific disk
+        # Immediate spindown of a single disk
         local _dev; _dev="${SPIN_DEV#/dev/}"   # sdb, /dev/sdb → sdb
         local disk_path="/dev/${_dev}"
-        [ -b "${disk_path}" ] || die "${disk_path} 不是有效的块设备"
+        [ -b "${disk_path}" ] || die "${disk_path} is not a valid block device"
         local pwr; pwr=$(get_power_state "${_dev}")
         case "${pwr}" in
             standby|sleep)
-                echo "${_dev}: 已是 ${pwr}，无需操作"
+                echo "${_dev}: already ${pwr}, nothing to do"
                 exit 0 ;;
         esac
-        log "立即停转 ${_dev}..."
+        log "Spinning down ${_dev}..."
         if [ "${DRY_RUN}" = true ]; then
             log "[dry-run] hdparm -y ${disk_path}"
         else
             sync
             hdparm -y "${disk_path}" >/dev/null 2>&1 \
                 && log "${_dev}: → standby" \
-                || die "${_dev}: hdparm -y 失败"
+                || die "${_dev}: hdparm -y failed"
         fi
         exit 0
     fi
 
-    # --once without -s: process DISK_IDS once, no config save, no scheduling
-    [ "${#DISK_IDS[@]}" -gt 0 ] || die "--once 需要 -s <dev> 或 -i <id>"
+    # --once mode: process DISK_IDS, no config save, no scheduling
+    [ "${#DISK_IDS[@]}" -gt 0 ] || die "--once requires -s <dev> or -i <id>"
 
     for disk_id in "${DISK_IDS[@]}"; do
         set +e; process_disk "${disk_id}"; set -e
@@ -318,9 +317,9 @@ readonly SERVICE_NAME="spindown-guard"
 readonly UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 
 cmd_install() {
-    [ "$(id -u)" -eq 0 ] || die "需要 root 权限安装 systemd service"
+    [ "$(id -u)" -eq 0 ] || die "root required to install systemd service"
 
-    load_config || die "未找到配置文件。请先运行 spindown-guard -i sdb 保存配置。"
+    load_config || die "No config file. Run: spindown-guard -i sdb"
 
     cat > "${UNIT_FILE}" <<UNIT
 [Unit]
@@ -341,42 +340,42 @@ UNIT
     systemctl enable "${SERVICE_NAME}.service"
     systemctl start "${SERVICE_NAME}.service" 2>/dev/null || true
 
-    echo "✔ systemd service 已安装: ${SERVICE_NAME}"
+    echo "✔ systemd service installed: ${SERVICE_NAME}"
     echo "  systemctl status ${SERVICE_NAME}"
 }
 
 cmd_uninstall() {
-    [ "$(id -u)" -eq 0 ] || die "需要 root 权限"
+    [ "$(id -u)" -eq 0 ] || die "root required"
     cancel_at_jobs
     systemctl disable --now "${SERVICE_NAME}.service" 2>/dev/null || true
     rm -f "${UNIT_FILE}"
     systemctl daemon-reload
     rm -f "${CONFIG_FILE}"
     rm -rf "${STATE_DIR}"
-    echo "✔ 已卸载"
+    echo "✔ uninstalled"
 }
 
 # ── Default: run cycle ────────────────────────────────────────────
 
 cmd_run() {
-    # Load config unless disks were explicitly passed
+    # Use saved config if no disks specified on command line
     if [ "${#DISK_IDS[@]}" -eq 0 ]; then
-        load_config || die "无配置文件且未指定磁盘。\n  用法: $(basename "${0}") -i sdb [-i sdc ...] [-t 分钟]\n        $(basename "${0}") --all"
+        load_config || die "no config and no disks specified.\n  Usage: $(basename "${0}") -i sdb [-i sdc ...] [-t MIN]\n         $(basename "${0}") --all"
     else
-        # Disks specified on CLI — save to config
+        # Disks specified on CLI — persist to config
         save_config
     fi
 
-    # Check atd is running
+    # Verify atd is running for self-scheduling
     if ! systemctl -q is-active atd 2>/dev/null && ! pgrep -x atd >/dev/null 2>&1; then
-        warn "atd 未运行 — 将无法自动调度下次检测"
-        warn "  安装: apt install at && systemctl enable --now atd"
+        warn "atd is not running — cannot self-schedule"
+        warn "  Fix: apt install at && systemctl enable --now atd"
     fi
 
     echo "═══════════════════════════════════════════════════════"
     echo "  spindown-guard v${SCRIPT_VERSION}  $(date '+%Y-%m-%d %H:%M:%S')"
-    echo "  阈值: ${IDLE_MIN} min  |  磁盘: ${#DISK_IDS[@]} 块"
-    [ "${DRY_RUN}" = true ] && echo "  *** DRY-RUN — 不会实际操作 ***"
+    echo "  Threshold: ${IDLE_MIN} min  |  Disks: ${#DISK_IDS[@]}"
+    [ "${DRY_RUN}" = true ] && echo "  *** DRY-RUN — no changes will be made ***"
     echo "═══════════════════════════════════════════════════════"
 
     mkdir -p "${STATE_DIR}"
@@ -389,7 +388,7 @@ cmd_run() {
                if [[ "${remain}" =~ ^[0-9]+$ ]] && [ "${remain}" -lt "${min_remain}" ]; then
                    min_remain="${remain}"
                fi ;;
-            1) # I/O 活跃或错误 → 按满阈值重检
+            1) # Busy or error — recheck after full threshold
                [ "${IDLE_MIN}" -lt "${min_remain}" ] && min_remain="${IDLE_MIN}" ;;
         esac
     done
@@ -397,11 +396,11 @@ cmd_run() {
     if [ "${min_remain}" -lt 9999 ]; then
         schedule_next "${min_remain}"
     else
-        log "所有磁盘已 standby，暂停调度。"
-        log "备份脚本中已包含立即停转，磁盘将在下次访问时自动唤醒。"
+        log "All disks are standby — pausing scheduler."
+        log "Disks will auto-wake on next access. Backup scripts can call spindown-guard --once."
     fi
 
-    # Cleanup stale state files
+    # Remove state files for disks no longer monitored
     local -A active_devs
     for id in "${DISK_IDS[@]}"; do
         local d; d=$(resolve_dev "${id}" 2>/dev/null || true)
@@ -418,39 +417,41 @@ cmd_run() {
 
 usage() {
     cat <<HELP
-spindown-guard v${SCRIPT_VERSION} — SATA HDD 空闲停转守护
+spindown-guard v${SCRIPT_VERSION} — SATA HDD idle-spindown daemon
 
-用法:
-  $(basename "${0}")                        从配置文件读取并运行（用于 systemd / at）
-  $(basename "${0}") -i <by-id> [-i ...]    指定磁盘，写入配置并运行
-  $(basename "${0}") --status               查看监控状态
-  $(basename "${0}") --ls                   列出所有 ATA 磁盘
-  $(basename "${0}") --once -s <dev>        立即停转一块盘
-  $(basename "${0}") --install              安装 systemd 开机启动
-  $(basename "${0}") --uninstall            卸载
+Usage:
+  $(basename "${0}")                        run with saved config (systemd / at)
+  $(basename "${0}") -i sdb [-i ...] [-t N] specify disks and run
+  $(basename "${0}") --status               show monitored disk states
+  $(basename "${0}") --ls                   list all ATA disks
+  $(basename "${0}") --once -s sdb          one-shot spindown
+  $(basename "${0}") --install              install systemd service
+  $(basename "${0}") --uninstall            remove everything
 
-参数:
-  -i, --disk <id>    磁盘 by-id 或设备名 sdb（可重复，每次覆盖完整列表）
-  --all              自动选择所有 SATA HDD
-  --once             单次运行，不保存配置、不调度后续
-  -s, --spin <dev>   配合 --once，立即停转指定盘（如 sdb）
-  -t, --idle <min>   空闲阈值（分钟），默认 20
-  --dry-run          只报告，不实际操作
-  -q, --quiet        减少输出
-  --status           查看状态
-  --ls               列出所有 ATA 磁盘
-  --install          安装 systemd service
-  --uninstall        卸载
-  -h, --help         帮助
+Options:
+  -i, --disk <id>    disk by-id or short name sdb (repeatable)
+  --all              auto-discover all SATA HDDs
+  --once             run once, no config save, no scheduling
+  -s, --spin <dev>   with --once, immediately spindown (e.g. sdb)
+  -t, --idle <min>   idle threshold in minutes (default 20)
+  --dry-run          simulate only, no changes
+  -q, --quiet        suppress per-disk log lines
+  --status           show monitored disk states
+  --ls               list all ATA disks
+  --install          install systemd service
+  --uninstall        remove everything
+  -h, --help         show this help
 
-原理:
-  读取 /proc/diskstats 扇区计数 → 对比快照 → 空闲达阈值后 hdparm -y
-  通过 at(1) 自调度，间隔 = 最短剩余空闲时间。所有盘 standby 后暂停。
+How it works:
+  Reads /proc/diskstats sector counters → compares to snapshot
+  → idle ≥ threshold → hdparm -y
+  Self-schedules via at(1) at the optimal interval.
+  Pauses when all disks are standby.
 
-示例:
-  $(basename "${0}") -i ata-DISK1 -i ata-DISK2          # 监控两块盘
-  $(basename "${0}") --once -s sdb           # 立即停转 sdb
-  $(basename "${0}") --status               # 查看所有盘状态
+Examples:
+  $(basename "${0}") -i sdb -t 20
+  $(basename "${0}") --once -s sdb
+  $(basename "${0}") --status
 HELP
 }
 
@@ -459,10 +460,10 @@ HELP
 while [ $# -gt 0 ]; do
     case "${1}" in
         -i|--disk)
-            [ -n "${2:-}" ] || die "-i 需要 by-id 或设备名（如 sdb）"
+            [ -n "${2:-}" ] || die "-i requires by-id or device name (e.g. sdb)"
             _arg="${2}"
             if [[ "${_arg}" =~ ^/dev/ ]] || [[ ! "${_arg}" =~ ^ata- ]]; then
-                _resolved=$(resolve_to_id "${_arg}") || die "无法解析: ${_arg}"
+                _resolved=$(resolve_to_id "${_arg}") || die "cannot resolve: ${_arg}"
                 DISK_IDS+=("${_resolved}")
             else
                 DISK_IDS+=("${_arg}")
@@ -472,7 +473,7 @@ while [ $# -gt 0 ]; do
         --status) COMMAND="status"; shift ;;
         --once)   COMMAND="once"; shift ;;
         -s|--spin)
-            [ -n "${2:-}" ] || die "-s 需要设备名（如 sdb）"; SPIN_DEV="${2}"; shift 2 ;;
+            [ -n "${2:-}" ] || die "-s requires device name (e.g. sdb)"; SPIN_DEV="${2}"; shift 2 ;;
         --all)
             for l in /dev/disk/by-id/ata-*; do
                 [ -e "${l}" ] || continue; [[ "$(basename "${l}")" =~ -part ]] && continue
@@ -481,13 +482,13 @@ while [ $# -gt 0 ]; do
             done
             shift ;;
         -t|--idle)
-            [ -n "${2:-}" ] || die "-t 需要分钟数"; IDLE_MIN="${2}"; shift 2 ;;
+            [ -n "${2:-}" ] || die "-t requires a number of minutes"; IDLE_MIN="${2}"; shift 2 ;;
         --dry-run) DRY_RUN=true; shift ;;
         -q|--quiet) QUIET=true; shift ;;
         --install) COMMAND="install"; shift ;;
         --uninstall) COMMAND="uninstall"; shift ;;
         -h|--help) usage; exit 0 ;;
-        *) die "未知参数: ${1}\n  用 -h 查看帮助" ;;
+        *) die "Unknown option: ${1}\n  Try -h for help" ;;
     esac
 done
 
@@ -505,11 +506,11 @@ case "${COMMAND}" in
         if [ "${#DISK_IDS[@]}" -gt 0 ]; then
             cmd_run
         elif load_config 2>/dev/null; then
-            # at-scheduled / systemd run — ok, config loaded
+            # at-scheduled / systemd run — config loaded, proceed
             cmd_run
         else
-            die "未指定磁盘。\n\n  用法: $(basename "${0}") -i sdb [-i sdc ...] [-t 分钟]\n        $(basename "${0}") --all\n\n  查看可用磁盘: $(basename "${0}") --ls"
+            die "No disks specified.\n\n  Usage: $(basename "${0}") -i sdb [-i sdc ...] [-t MIN]\n         $(basename "${0}") --all\n\n  List available disks: $(basename "${0}") --ls"
         fi
         ;;
-    *)        die "未知命令: ${COMMAND}" ;;
+    *)        die "Unknown command: ${COMMAND}" ;;
 esac
