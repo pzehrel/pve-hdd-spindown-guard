@@ -29,7 +29,10 @@ spindown-guard
 # Pick disks interactively
 spindown-guard --select -t 20
 
-# Specify disks explicitly
+# Specify disks by name (resolves to by-id automatically)
+spindown-guard -i sdb -i sdd -t 20
+
+# Full by-id works too
 spindown-guard -i ata-WDC_WD10PURX-...WD-WCAW3FTHF6L5 -t 20
 
 # All rotational ATA disks
@@ -38,11 +41,24 @@ spindown-guard --all -t 20
 # Show monitored disk states
 spindown-guard --status
 
+# List all ATA disks
+spindown-guard --ls
+
 # One-shot spindown (call from backup scripts)
 spindown-guard --once -s sdb
+```
 
-# Install systemd service (auto-start on boot)
+### Auto-start on boot
+
+```bash
+# Install systemd service — runs on boot, self-schedules via at(1)
 spindown-guard --install
+
+# Check status
+systemctl status spindown-guard
+
+# Remove
+spindown-guard --uninstall
 ```
 
 ## How It Works

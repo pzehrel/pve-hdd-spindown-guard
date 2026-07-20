@@ -29,7 +29,10 @@ spindown-guard -h                   # 帮助
 # 交互式选择
 spindown-guard --select -t 20
 
-# CLI 指定
+# CLI 指定（支持简写 sdb，自动解析为 by-id）
+spindown-guard -i sdb -i sdd -t 20
+
+# 完整 by-id 也可以
 spindown-guard -i ata-WDC_WD10PURX-...WD-WCAW3FTHF6L5 -t 20
 
 # 监控所有 HDD
@@ -38,11 +41,24 @@ spindown-guard --all -t 20
 # 查看状态
 spindown-guard --status
 
+# 列出所有 ATA 磁盘
+spindown-guard --ls
+
 # 立即停转（备份脚本末尾调用）
 spindown-guard --once -s sdb
+```
 
-# 开机启动
+### 开机启动
+
+```bash
+# 安装 systemd service — 开机自动运行，通过 at(1) 自调度
 spindown-guard --install
+
+# 查看状态
+systemctl status spindown-guard
+
+# 卸载
+spindown-guard --uninstall
 ```
 
 ## 原理
