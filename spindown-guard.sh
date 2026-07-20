@@ -33,8 +33,6 @@ QUIET=false
 COMMAND=""                     # ""=run, ls, status, install, uninstall, once
 DISK_IDS=()                    # by-id strings
 SPIN_DEV=""                    # for --once -s
-IS_TTY=false
-[ -t 0 ] && [ -t 1 ] && IS_TTY=true
 
 # ── Helpers ───────────────────────────────────────────────────────
 
@@ -322,7 +320,7 @@ readonly UNIT_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 cmd_install() {
     [ "$(id -u)" -eq 0 ] || die "需要 root 权限安装 systemd service"
 
-    load_config || die "未找到配置文件。请先运行 --select 或 -i 保存配置。"
+    load_config || die "未找到配置文件。请先运行 spindown-guard -i sdb 保存配置。"
 
     cat > "${UNIT_FILE}" <<UNIT
 [Unit]
@@ -363,7 +361,7 @@ cmd_uninstall() {
 cmd_run() {
     # Load config unless disks were explicitly passed
     if [ "${#DISK_IDS[@]}" -eq 0 ]; then
-        load_config || die "无配置文件且未指定磁盘。\n  用法: $(basename "${0}") --select\n  或:   $(basename "${0}") -i <by-id>"
+        load_config || die "无配置文件且未指定磁盘。\n  用法: $(basename "${0}") -i sdb [-i sdc ...] [-t 分钟]\n        $(basename "${0}") --all"
     else
         # Disks specified on CLI — save to config
         save_config
@@ -498,7 +496,6 @@ done
 acquire_lock
 
 case "${COMMAND}" in
-    select)   cmd_select; [ "${#DISK_IDS[@]}" -gt 0 ] && { save_config; cmd_run; } || echo "未选择磁盘，退出。" ;;
     ls)       cmd_ls ;;
     status)   cmd_status ;;
     install)  cmd_install ;;
